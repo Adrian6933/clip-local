@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.astro/
+.venv/
+.clippa-data/
+.test-data/
+__pycache__/
+.pytest_cache/
+*.log
+
+.env
+.env.*
