@@ -1,5 +1,21 @@
 # Estado verificable · 19 de septiembre de 2026
 
+## Actualización funcional · 23 de septiembre de 2026
+
+Implementados: transcripción local con faster-whisper Base, detección de idioma, transcripción multilingüe y traducción al inglés; palabras con tiempos y bloques de subtítulos; editor de texto con búsqueda, salto temporal, corrección, guardado con revisión y descarga SRT del intervalo; previsualización textual y exportación ASS incrustada con instantánea inmutable. La exportación desde la UI se deshabilita mientras hay texto sin guardar.
+
+Nueva mesa de análisis con duraciones flexibles de propuestas (90, 180, 300 o 600 segundos). Las propuestas usan pausas y bloques de discurso: **no puntúan interés semántico ni viralidad**. El editor permite intervalos de otras duraciones dentro del original. Una prueba conserva un bloque de 90 segundos sin convertirlo en tres clips de 30.
+
+Detector YuNet local sobre hasta 120 muestras del fragmento; propone un encuadre fijo individual o dividido, aplicable por el usuario. Conserva proporciones durante detección. **No hay seguimiento temporal ni reconocimiento del hablante activo**. La imagen de referencia pública anotada de OpenCV produjo 10 detecciones, y un vídeo sin caras produjo cero; esto comprueba integración, no precisión sobre un corpus. En el vídeo de ocho minutos ya importado, los primeros 30 segundos dieron una cara como caso más frecuente sobre 60 muestras.
+
+Comprobado: 4 tests aprobados, TypeScript sin errores y compilación de producción. Ensayos de inferencia local sobre voz sintética de Windows en español e inglés: idiomas reconocidos y subtítulos exportados. Traducción ES→EN ejecutada con resultado coherente. Fotograma del MP4 con subtítulos revisado visualmente. Evidencia técnica en `.test-data/analysis-validation.json`, `subtitles-es.mp4`, `subtitles-en.mp4`, `translation-validation.txt` y `face-validation.json`. Los ensayos sintéticos no certifican calidad en conversaciones con ruido o solapamiento.
+
+La cancelación de jobs usa transición SQL condicional. Análisis en proceso separado con heartbeat y cancelación independientes de stdout. FFmpeg tiene lectura de progreso separada para poder cancelar aunque deje de emitir salida. Todavía no hay leases con propietario ni recuperación por etapas completa.
+
+El siguiente bloque importante sigue siendo seguimiento por escenas, asociación audiovisual y dirección al hablante, junto con selección semántica de momentos completos. La transcripción, subtítulos y detector descritos aquí sustituyen los pendientes homónimos de la fotografía histórica inferior. Modelos y límites en MODELS.md.
+
+Prueba adicional con el vídeo real de 8:28 ya importado: transcripción completa terminada en local, idioma inglés detectado, 1849 palabras y 325 bloques. Se generaron propuestas desde la UI, se activaron subtítulos, se guardó y se exportó el intervalo inicial de 30 segundos con descarga disponible. No se ha anotado el vídeo para medir WER o sincronía; el resultado requiere revisión editorial normal. El original permanece intacto.
+
 F1 funcional y parte manual de F2 implementadas. El plan completo todavía no está terminado.
 
 ## Continuación planificada

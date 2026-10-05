@@ -4,6 +4,8 @@ Estudio personal de clips: **Astro + React + TypeScript**, **Python + FastAPI**,
 
 ## Arranque en Windows
 
+Acceso directo instalado: **Clippa** en el escritorio. Abre una ventana de aplicación del navegador e inicia API, procesador y web compilada sin consola. **Detener Clippa** detiene esos procesos e interrumpe trabajos activos: úsalo cuando hayan terminado. Cerrar la ventana deja el motor disponible en segundo plano. Sigue dependiendo de esta carpeta, Node y `.venv`; no es todavía un instalador independiente. Para recrear los accesos: `powershell -File scripts/install-shortcut.ps1`. Diagnóstico del lanzador: `.clippa-data/desktop/studio.log`.
+
 Requisitos: Node.js compatible con Astro 7 y Python 3.13. Desde esta carpeta:
 
 ```powershell
@@ -27,7 +29,11 @@ Los trabajos persisten en SQLite, muestran progreso real y permiten cancelar o r
 
 ## Límites actuales
 
-Seguimiento automático, asociación de voces y caras, transcripción, subtítulos, propuestas automáticas e instalador Tauri **siguen pendientes**. La pantalla dividida usa centros manuales fijos. Se rechazan HDR y píxeles no cuadrados hasta implementar conversión controlada. La vista previa reducida puede tener pequeñas diferencias de redondeo respecto al original.
+Actualización 23/09: ya hay transcripción local multilingüe y detección de idioma, corrección/búsqueda de texto, descarga SRT y subtítulos incrustados. En el editor, usa «Tu mesa de análisis», guarda correcciones y activa «Mostrar e incrustar subtítulos». La traducción disponible tiene inglés como destino. Preparar modelos en otro equipo: `.\.venv\Scripts\python.exe scripts/setup-analysis.py`.
+
+También hay detección de caras del intervalo seleccionado con una propuesta de encuadre fijo individual/dividido. Los fragmentos sugeridos usan pausas y duración flexible (hasta 10 minutos configurables); no son una selección semántica de los mejores momentos. Seguimiento del movimiento, identificación de hablante y dirección automática siguen pendientes.
+
+Seguimiento automático, asociación de voces y caras, propuestas semánticas e instalador Tauri **siguen pendientes**. La pantalla dividida usa centros fijos, manuales o propuestos por detección. Se rechazan HDR y píxeles no cuadrados hasta implementar conversión controlada. La vista previa reducida puede tener diferencias de redondeo y de composición tipográfica respecto al render ASS final.
 
 Plan completo: `../PLAN_CLIP_LOCAL_PARA_LUNA.md`. Estado verificable: `docs/STATUS.md`. Los JSON antiguos se conservan sin migración automática: no representaban importaciones validadas.
 

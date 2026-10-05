@@ -1,17 +1,22 @@
 import asyncio
 from contextlib import asynccontextmanager
 import json
+import math
 import shutil
 import time
 from pathlib import Path
+from importlib.util import find_spec
 from typing import Literal
 from urllib.parse import unquote
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field, ConfigDict
-from .core import DATA, FFMPEG, FFPROBE, db, initialize, uid, projects, project, put_project, probe, enqueue, job, update_job
+from .core import DATA, FFMPEG, FFPROBE, db, initialize, uid, projects, project, put_project, probe, enqueue, job, update_job, transcript
+from .captions import clip_cues, srt, moment_candidates
+from .core import MODELS
 
 @asynccontextmanager
 async def lifespan(app):
@@ -47,6 +52,7 @@ class Edit(BaseModel):
     a: Point = Point(x=.3)
     b: Point = Point(x=.7)
     revision: int = Field(default=0, ge=0)
+    subtitles: bool = False
 
 def valid_edit(pid, edit):
     p = project(pid)
@@ -62,7 +68,8 @@ def health():
 
 @app.get('/api/capabilities')
 def capabilities():
-    return {'ffmpeg': Path(FFMPEG).is_file(), 'ffprobe': Path(FFPROBE).is_file(), 'transcription': False, 'faceTracking': False, 'diarization': False, 'storage': 'SQLite', 'engine': 'Python · FastAPI', 'freeBytes': shutil.disk_usage(DATA).free}
+    available = find_spec('faster_whisper') is not None and (MODELS / 'faster-whisper-base/model.bin').is_file()
+    return {'ffmpeg': Path(FFMPEG).is_file(), 'ffprobe': Path(FFPROBE).is_file(), 'transcription': available, 'faceTracking': False, 'diarization': False, 'storage': 'SQLite', 'engine': 'Python · FastAPI', 'freeBytes': shutil.disk_usage(DATA).free}
 
 @app.get('/api/projects')
 def list_projects():
@@ -143,7 +150,131 @@ def export(pid: str, edit: Edit):
     p = valid_edit(pid, edit)
     if p['status'] != 'ready':
         raise HTTPException(409, 'Espera a que termine la preparación del vídeo.')
-    return enqueue(pid, 'export', edit.model_dump())
+    spec = edit.model_dump()
+    if edit.subtitles:
+        text = transcript(pid)
+        if not text or not text['cues']:
+            raise HTTPException(409, 'Genera o escribe los subtítulos antes de exportarlos.')
+        spec['captionSnapshot'] = clip_cues(text['cues'], edit.start, edit.end)
+        spec['transcriptRevision'] = text['revision']
+    return enqueue(pid, 'export', spec)
+
+
+class TranscriptionRequest(BaseModel):
+    language: str | None = Field(default=None, max_length=8)
+    task: Literal['transcribe', 'translate'] = 'transcribe'
+    replace: bool = False
+
+
+class FaceRequest(BaseModel):
+    start: float = Field(ge=0,allow_inf_nan=False)
+    end: float = Field(gt=0,allow_inf_nan=False)
+
+
+@app.post('/api/projects/{pid}/faces')
+def analyze_faces(pid: str, options: FaceRequest):
+    p=project(pid)
+    if p['status']!='ready' or options.end<=options.start or options.end>p['media']['duration']:
+        raise HTTPException(422,'Selecciona un intervalo válido de un vídeo preparado.')
+    if not (MODELS/'yunet-2026.onnx').is_file() or find_spec('cv2') is None:
+        raise HTTPException(409,'Falta instalar el detector local de caras.')
+    with db() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        if conn.execute("SELECT 1 FROM jobs WHERE project_id=? AND kind='faces' AND status IN ('queued','running','cancel_requested')",(pid,)).fetchone():
+            raise HTTPException(409,'Ya hay un análisis de caras en curso.')
+        jid=uid()
+        conn.execute('INSERT INTO jobs (id,project_id,kind,status,spec,created,heartbeat) VALUES (?,?,?,?,?,?,?)',(jid,pid,'faces','queued',options.model_dump_json(),time.time(),time.time()))
+    return job(jid)
+
+
+@app.get('/api/projects/{pid}/faces')
+def get_faces(pid: str):
+    project(pid)
+    with db() as conn:
+        row=conn.execute('SELECT document FROM face_analysis WHERE project_id=?',(pid,)).fetchone()
+    return {'analysis':json.loads(row[0]) if row else None}
+
+
+@app.post('/api/projects/{pid}/transcribe')
+def transcribe(pid: str, options: TranscriptionRequest):
+    p = project(pid)
+    if not p.get('media') or not p['media'].get('hasAudio'):
+        raise HTTPException(422, 'Este vídeo no tiene una pista de audio para transcribir.')
+    if not capabilities()['transcription']:
+        raise HTTPException(409, 'Falta instalar el modelo de transcripción local.')
+    if options.language:
+        from faster_whisper.tokenizer import _LANGUAGE_CODES
+        if options.language not in _LANGUAGE_CODES:
+            raise HTTPException(422, 'Idioma no compatible.')
+    with db() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        existing = conn.execute('SELECT revision FROM transcripts WHERE project_id=?', (pid,)).fetchone()
+        if existing and not options.replace:
+            raise HTTPException(409, 'Ya hay una transcripción. Activa reemplazar para generar otra.')
+        if conn.execute("SELECT 1 FROM jobs WHERE project_id=? AND kind='transcribe' AND status IN ('queued','running','cancel_requested')", (pid,)).fetchone():
+            raise HTTPException(409, 'Ya hay una transcripción en curso.')
+        jid = uid()
+        spec = dict(options.model_dump(), baseRevision=existing[0] if existing else -1)
+        conn.execute('INSERT INTO jobs (id,project_id,kind,status,spec,created,heartbeat) VALUES (?,?,?,?,?,?,?)', (jid,pid,'transcribe','queued',json.dumps(spec),time.time(),time.time()))
+    return job(jid)
+
+
+@app.get('/api/projects/{pid}/transcript')
+def get_transcript(pid: str):
+    project(pid)
+    return {'transcript': transcript(pid)}
+
+
+class Cue(BaseModel):
+    start: float = Field(ge=0, allow_inf_nan=False)
+    end: float = Field(gt=0, allow_inf_nan=False)
+    text: str = Field(max_length=500)
+
+
+class TranscriptEdit(BaseModel):
+    revision: int = Field(ge=0)
+    cues: list[Cue] = Field(max_length=30000)
+
+
+@app.put('/api/projects/{pid}/transcript')
+def edit_transcript(pid: str, edit: TranscriptEdit):
+    p = project(pid)
+    previous_end = 0
+    for cue in edit.cues:
+        if cue.start < previous_end or cue.end <= cue.start or cue.end > p['media']['duration']+.05:
+            raise HTTPException(422, 'Los subtítulos deben estar ordenados, sin solaparse y dentro del vídeo.')
+        previous_end = cue.end
+    with db() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT revision,document FROM transcripts WHERE project_id=?', (pid,)).fetchone()
+        if not row or row['revision'] != edit.revision:
+            raise HTTPException(409, 'La transcripción ha cambiado. Recárgala antes de guardar.')
+        doc = json.loads(row['document'])
+        doc['cues'] = [c.model_dump() for c in edit.cues]
+        conn.execute('UPDATE transcripts SET revision=revision+1,document=? WHERE project_id=?', (json.dumps(doc),pid))
+    return {'transcript': transcript(pid)}
+
+
+@app.get('/api/projects/{pid}/subtitles.srt')
+def download_srt(pid: str, start: float = 0, end: float | None = None):
+    p = project(pid)
+    doc = transcript(pid)
+    if not doc:
+        raise HTTPException(404, 'Todavía no hay subtítulos.')
+    end = end if end is not None else p['media']['duration']
+    if not math.isfinite(start) or not math.isfinite(end) or start<0 or end<=start or end>p['media']['duration']+.05:
+        raise HTTPException(422, 'Intervalo de subtítulos inválido.')
+    return Response(srt(clip_cues(doc['cues'], start, end)),
+                    media_type='application/x-subrip', headers={'Content-Disposition':'attachment; filename="clippa-subtitulos.srt"'})
+
+
+@app.get('/api/projects/{pid}/moments')
+def moments(pid: str, maximum: int = 180):
+    project(pid)
+    if not 30 <= maximum <= 600:
+        raise HTTPException(422, 'La duración máxima debe estar entre 30 y 600 segundos.')
+    doc = transcript(pid)
+    return {'moments': moment_candidates(doc['cues'], maximum=maximum) if doc else [], 'method':'pauses-and-sentences'}
 
 @app.get('/api/jobs')
 def get_jobs():
@@ -153,9 +284,8 @@ def get_jobs():
 
 @app.post('/api/jobs/{jid}/cancel')
 def cancel(jid: str):
-    j = job(jid)
-    if j['status'] in ('queued', 'running'):
-        update_job(jid, status='cancelled' if j['status'] == 'queued' else 'cancel_requested')
+    with db() as conn:
+        conn.execute("UPDATE jobs SET status=CASE WHEN status='queued' THEN 'cancelled' ELSE 'cancel_requested' END WHERE id=? AND status IN ('queued','running')", (jid,))
     return job(jid)
 
 @app.post('/api/jobs/{jid}/retry')

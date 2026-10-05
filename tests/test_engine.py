@@ -70,3 +70,44 @@ def test_crop_limits():
             w,h,left,top = crop_box(1920,1080,9/16,x,y)
             assert left >= 0 and top >= 0 and left+w <= 1920 and top+h <= 1080
             assert all(n%2 == 0 for n in [w,h,left,top])
+
+
+def test_captions_and_flexible_moments():
+    from engine.captions import cues_from_words, clip_cues, srt, ass, moment_candidates
+    words=[{'start':0,'end':.8,'text':'Hola'},{'start':.8,'end':1.5,'text':'mundo.'},{'start':3,'end':4,'text':'Otro.'}]
+    cues=cues_from_words(words)
+    assert len(cues)==2
+    clipped=clip_cues(cues,1,3.5)
+    assert clipped[0]['start']==0 and clipped[-1]['end']==2.5
+    assert '00:00:00,000 --> 00:00:00,500' in srt(clipped)
+    protected=ass([{'start':0,'end':1,'text':r'{\pos(0,0)} test'}])
+    assert r'{\pos' not in protected
+    long=[{'start':i*5,'end':(i+1)*5,'text':'Una idea que continúa.'} for i in range(18)]
+    result=moment_candidates(long,maximum=180)
+    assert len(result)==1 and result[0]['end']-result[0]['start']==90
+
+
+def test_transcript_revision_and_export_snapshot():
+    import json
+    with TestClient(app) as client:
+        source=make_video()
+        p=client.post('/api/projects',headers=HEADERS,json={'name':'Caption test'}).json()
+        pid=p['id']
+        assert client.post(f'/api/projects/{pid}/assets',headers=HEADERS,content=source.read_bytes()).status_code==200
+        process(claim())
+        p=client.get(f'/api/projects/{pid}').json()
+        doc={'language':'es','task':'transcribe','cues':[{'start':0,'end':2,'text':'Texto original.'}]}
+        with db() as conn:
+            conn.execute('INSERT OR REPLACE INTO transcripts VALUES (?,?,?)',(pid,0,json.dumps(doc)))
+        request={'revision':0,'cues':[{'start':0,'end':2,'text':'Corrección con acentos.'}]}
+        assert client.put(f'/api/projects/{pid}/transcript',headers=HEADERS,json=request).status_code==200
+        assert client.put(f'/api/projects/{pid}/transcript',headers=HEADERS,json=request).status_code==409
+        edit=p['edit']|{'subtitles':True}
+        j=client.post(f'/api/projects/{pid}/exports',headers=HEADERS,json=edit).json()
+        request['revision']=1
+        request['cues'][0]['text']='Otra versión.'
+        assert client.put(f'/api/projects/{pid}/transcript',headers=HEADERS,json=request).status_code==200
+        assert job(j['id'])['spec']['captionSnapshot'][0]['text']=='Corrección con acentos.'
+        process(claim())
+        assert job(j['id'])['status']=='succeeded',job(j['id'])
+        assert client.post(f"/api/jobs/{j['id']}/cancel",headers=HEADERS).json()['status']=='succeeded'

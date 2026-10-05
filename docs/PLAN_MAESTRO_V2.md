@@ -2,6 +2,8 @@
 
 Fecha: 19 de septiembre de 2026. Destinatario: Luna o la siguiente sesión de implementación. Estado: planificación; las tareas siguientes están pendientes salvo la base descrita expresamente como existente.
 
+Actualización de requisitos (23/09): el usuario prioriza texto de lo que se dice, varios idiomas, detección multipersona, composición arriba/abajo, enfoque al hablante y selección por calidad del momento sin forzar clips cortos. Un bloque coherente de 90 segundos debe mantenerse. La entrega de septiembre incorpora transcripción local, subtítulos y propuestas de encuadre fijo; seguir al hablante y valorar interés semántico permanecen pendientes. Consultar STATUS para evidencia actual.
+
 Este documento amplía `../../PLAN_CLIP_LOCAL_PARA_LUNA.md` y concreta la continuación desde el código actual. No reiniciar el proyecto. Ante diferencias, conservar Astro como frontend y usar el orden de trabajo de este documento. `STATUS.md` registra evidencia, no intenciones.
 
 ## 1. Resultado que debe conseguir el producto

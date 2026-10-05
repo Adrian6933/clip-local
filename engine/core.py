@@ -6,10 +6,13 @@ import sqlite3
 import subprocess
 import time
 import uuid
+import threading
+import queue
 from contextlib import contextmanager
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = Path(os.environ.get('CLIPPA_DATA_DIR', str(ROOT / '.clippa-data'))).resolve()
+MODELS = Path(os.environ.get('CLIPPA_MODEL_DIR', str(DATA / 'models'))).resolve()
 FFMPEG = os.environ.get('CLIPPA_FFMPEG', str(ROOT / 'node_modules/ffmpeg-static/ffmpeg.exe'))
 FFPROBE = os.environ.get('CLIPPA_FFPROBE', str(ROOT / 'node_modules/ffprobe-static/bin/win32/x64/ffprobe.exe'))
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
@@ -33,6 +36,32 @@ def initialize():
     with db() as conn:
         conn.execute('CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, document TEXT NOT NULL)')
         conn.execute('CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, project_id TEXT, kind TEXT, status TEXT, progress REAL DEFAULT 0, error TEXT, spec TEXT, output TEXT, created REAL, heartbeat REAL)')
+        conn.execute('CREATE TABLE IF NOT EXISTS transcripts (project_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, document TEXT NOT NULL)')
+        conn.execute('CREATE TABLE IF NOT EXISTS face_analysis (project_id TEXT PRIMARY KEY, document TEXT NOT NULL)')
+
+
+def transcript(pid):
+    with db() as conn:
+        row = conn.execute('SELECT revision,document FROM transcripts WHERE project_id=?', (pid,)).fetchone()
+    return dict(json.loads(row['document']), revision=row['revision']) if row else None
+
+
+def supervise(command, jid, log_path):
+    """Poll cancellation and heartbeat independently of child output."""
+    with log_path.open('ab') as log:
+        proc = subprocess.Popen(command, stdout=log, stderr=log, stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
+        try:
+            while proc.poll() is None:
+                if job(jid)['status'] == 'cancel_requested':
+                    raise InterruptedError('Trabajo cancelado')
+                update_job(jid, heartbeat=time.time())
+                time.sleep(.3)
+            if proc.returncode:
+                raise ValueError('El análisis no se pudo completar. Revisa el diagnóstico local del trabajo.')
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
 
 def projects():
     with db() as conn:
@@ -106,18 +135,29 @@ def composition(meta, edit, width=1080, height=1920):
         return f"[0:v]split=2[a][b];[a]{crop(edit['a'], height//2)}[a1];[b]{crop(edit['b'], height//2)}[b1];[a1][b1]vstack=inputs=2[v]"
     return f"[0:v]{crop(edit['a'], height)}[v]"
 
-def run_ffmpeg(args, jid, duration):
+def run_ffmpeg(args, jid, duration, cwd=None):
     work = DATA / 'work'
     work.mkdir(exist_ok=True)
     log = work / f'{jid}.log'
     with log.open('wb') as stderr:
-        proc = subprocess.Popen([FFMPEG, '-hide_banner', '-y', '-nostdin', '-progress', 'pipe:1', '-stats_period', '0.5', *args], stdout=subprocess.PIPE, stderr=stderr, creationflags=NO_WINDOW)
+        proc = subprocess.Popen([FFMPEG, '-hide_banner', '-y', '-nostdin', '-progress', 'pipe:1', '-stats_period', '0.5', *args], cwd=cwd, stdout=subprocess.PIPE, stderr=stderr, creationflags=NO_WINDOW)
+        lines = queue.Queue()
+        def read_output():
+            for line in iter(proc.stdout.readline, b''):
+                lines.put(line)
+        reader = threading.Thread(target=read_output, daemon=True)
+        reader.start()
         try:
-            for raw in iter(proc.stdout.readline, b''):
+            last_heartbeat = 0
+            while proc.poll() is None or not lines.empty():
                 if job(jid)['status'] == 'cancel_requested':
                     proc.kill()
                     proc.wait()
                     raise InterruptedError('Trabajo cancelado')
+                try:
+                    raw = lines.get(timeout=.25)
+                except queue.Empty:
+                    raw = b''
                 line = raw.decode('utf8', errors='replace').strip()
                 progress = {}
                 if line.startswith('out_time_us='):
@@ -125,10 +165,14 @@ def run_ffmpeg(args, jid, duration):
                         progress['progress'] = min(.99, max(0, int(line.split('=')[1]) / 1e6 / duration))
                     except ValueError:
                         pass
-                update_job(jid, heartbeat=time.time(), **progress)
+                if progress or time.time() - last_heartbeat >= 1:
+                    update_job(jid, heartbeat=time.time(), **progress)
+                    last_heartbeat = time.time()
             if proc.wait() != 0:
                 raise ValueError('No se pudo procesar el vídeo. Revisa el archivo y el diagnóstico local.')
         finally:
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
+            reader.join(timeout=2)
+            proc.stdout.close()

@@ -1,7 +1,9 @@
 """Separate durable SQLite queue worker. One heavy process at a time."""
 import json
 import time
-from .core import DATA, db, initialize, project, run_ffmpeg, composition, probe, update_job, job
+import sys
+from .core import DATA, db, initialize, project, run_ffmpeg, composition, probe, update_job, job, supervise
+from .captions import ass
 
 def claim():
     with db() as conn:
@@ -20,6 +22,39 @@ def process(j):
     source = folder / 'source'
     temp = folder / f"{j['id']}.partial.mp4"
     try:
+        if j['kind'] == 'faces':
+            output = folder / f"{j['id']}.analysis.json"
+            try:
+                supervise([sys.executable, '-m', 'engine.faces', j['id']], j['id'], folder / f"{j['id']}.analysis.log")
+                doc = json.loads(output.read_text(encoding='utf8'))
+                with db() as conn:
+                    conn.execute('BEGIN IMMEDIATE')
+                    if conn.execute('SELECT status FROM jobs WHERE id=?',(j['id'],)).fetchone()[0] == 'cancel_requested':
+                        raise InterruptedError('Trabajo cancelado')
+                    conn.execute('INSERT OR REPLACE INTO face_analysis VALUES (?,?)',(p['id'],json.dumps(doc)))
+                    conn.execute("UPDATE jobs SET status='succeeded',progress=1,heartbeat=? WHERE id=?",(time.time(),j['id']))
+            finally:
+                output.unlink(missing_ok=True)
+            return
+        if j['kind'] == 'transcribe':
+            output = folder / f"{j['id']}.analysis.json"
+            try:
+                supervise([sys.executable, '-m', 'engine.transcribe', j['id']], j['id'], folder / f"{j['id']}.analysis.log")
+                doc = json.loads(output.read_text(encoding='utf8'))
+                with db() as conn:
+                    conn.execute('BEGIN IMMEDIATE')
+                    state = conn.execute('SELECT status FROM jobs WHERE id=?', (j['id'],)).fetchone()[0]
+                    if state == 'cancel_requested':
+                        raise InterruptedError('Trabajo cancelado')
+                    row = conn.execute('SELECT revision FROM transcripts WHERE project_id=?', (p['id'],)).fetchone()
+                    revision = row[0] if row else -1
+                    if revision != j['spec']['baseRevision']:
+                        raise ValueError('Los subtítulos se editaron durante el análisis. Se conserva tu versión; vuelve a generar si lo necesitas.')
+                    conn.execute('INSERT OR REPLACE INTO transcripts VALUES (?,?,?)', (p['id'], revision+1, json.dumps(doc, ensure_ascii=False)))
+                    conn.execute("UPDATE jobs SET status='succeeded',progress=1,heartbeat=? WHERE id=?", (time.time(), j['id']))
+            finally:
+                output.unlink(missing_ok=True)
+            return
         if j['kind'] == 'proxy':
             args = ['-i', str(source), '-map', '0:v:0', '-map', '0:a:0?', '-vf', 'scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '24', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-movflags', '+faststart', str(temp)]
             duration = p['media']['duration']
@@ -28,9 +63,13 @@ def process(j):
             edit = j['spec']
             duration = edit['end'] - edit['start']
             graph = composition(p['media'], edit)
+            if edit.get('subtitles') and edit.get('captionSnapshot'):
+                captions = folder / f"{j['id']}.ass"
+                captions.write_text(ass(edit['captionSnapshot']), encoding='utf-8-sig')
+                graph = graph.replace('[v]', '[uncaptioned]') + f";[uncaptioned]subtitles=filename={j['id']}.ass[v]"
             args = ['-ss', str(edit['start']), '-i', str(source), '-t', str(duration), '-filter_complex', graph, '-map', '[v]', '-map', '0:a:0?', '-r', '30', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-movflags', '+faststart', str(temp)]
             final = folder / f"{j['id']}.mp4"
-        run_ffmpeg(args, j['id'], duration)
+        run_ffmpeg(args, j['id'], duration, cwd=folder)
         result = probe(temp)
         if abs(result['duration'] - duration) > .3:
             raise ValueError('La duración exportada no coincide con el recorte solicitado.')
@@ -44,7 +83,10 @@ def process(j):
                 current = json.loads(conn.execute('SELECT document FROM projects WHERE id=?', (p['id'],)).fetchone()[0])
                 current['status'] = 'ready'
                 conn.execute('UPDATE projects SET document=? WHERE id=?', (json.dumps(current), p['id']))
-        update_job(j['id'], status='succeeded', progress=1, output=final.name, heartbeat=time.time())
+        with db() as conn:
+            changed=conn.execute("UPDATE jobs SET status='succeeded',progress=1,output=?,heartbeat=? WHERE id=? AND status='running'",(final.name,time.time(),j['id'])).rowcount
+            if not changed:
+                raise InterruptedError('Trabajo cancelado')
     except InterruptedError:
         update_job(j['id'], status='cancelled')
     except Exception as exc:
